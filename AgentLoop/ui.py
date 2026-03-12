@@ -115,8 +115,14 @@ async def main():
             system_prompt=RUNNER_SYSTEM_PROMPT,
             tools=[ToolRunCommandInDevContainer, ToolInteractWithUser],
         ),
+        WorkerConfig(
+            name="runner",
+            description="Can run shell commands inside the dev container.",
+            system_prompt=RUNNER_SYSTEM_PROMPT,
+            tools=[ToolRunCommandInDevContainer, ToolInteractWithUser],
+        ),
     ]
-
+    # Initialize with predefined workers
     loop = OrchestratedAgentLoop(
         model=selected_model,
         orchestrator_prompt=ORCHESTRATOR_SYSTEM_PROMPT,

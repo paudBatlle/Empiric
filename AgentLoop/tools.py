@@ -111,3 +111,43 @@ def create_tool_delegate_to_agent(
     ToolDelegateToAgent.__name__ = tool_name
     ToolDelegateToAgent.__doc__ = description
     return ToolDelegateToAgent
+
+
+def create_tool_add_worker(loop: OrchestratedAgentLoop) -> Type[Tool]:
+    class ToolAddWorker(Tool):
+        """Create a new worker agent and register a delegate tool on the orchestrator."""
+
+        name: str = Field(description="Unique name for the new worker")
+        description: str = Field(description="Short description of what this worker does")
+        system_prompt: str = Field(description="System prompt for the worker")
+        # For a first version, keep tools simple: choose from a fixed set by name.
+        tool_names: list[str] = Field(
+            default_factory=list,
+            description="List of tool class names (as strings) to enable for this worker",
+        )
+
+        async def __call__(self) -> str:
+            # map tool_names -> actual Tool classes
+            from agentLoop import tools as tools_module  # or wherever your tools live
+
+            available_tool_classes: dict[str, type[Tool]] = {
+                cls.__name__: cls
+                for cls in vars(tools_module).values()
+                if isinstance(cls, type) and issubclass(cls, Tool)
+            }
+            selected_tools: list[type[Tool]] = []
+            for name in self.tool_names:
+                tool_cls = available_tool_classes.get(name)
+                if tool_cls is not None:
+                    selected_tools.append(tool_cls)
+
+            config = WorkerConfig(
+                name=self.name,
+                description=self.description,
+                system_prompt=self.system_prompt,
+                tools=selected_tools,
+            )
+            loop.add_worker(config)
+            return f"Worker `{self.name}` created with tools: {[t.__name__ for t in selected_tools]}"
+
+    return ToolAddWorker

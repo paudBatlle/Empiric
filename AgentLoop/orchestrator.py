@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from agent import Agent, AgentEvent, EventText, EventToolResult, EventToolUse
-from tools import Tool, create_tool_delegate_to_agent
+from tools import Tool, create_tool_delegate_to_agent, create_tool_add_worker
 
 
 @dataclass
@@ -10,7 +10,7 @@ class WorkerConfig:
     name: str
     description: str
     system_prompt: str
-    tools: list[Tool]
+    tools: list[type[Tool]]
 
 
 class OrchestratedAgentLoop:
@@ -48,12 +48,13 @@ class OrchestratedAgentLoop:
                     delegate=self._build_delegate(worker_name, worker),
                 )
             )
+        ToolAddWorker = create_tool_add_worker(self)
 
         self.orchestrator = Agent(
             name="orchestrator",
             model=model,
             system_prompt=orchestrator_prompt,
-            tools=[*(shared_tools or []), *orchestrator_tools],
+            tools=[ToolAddWorker, *(shared_tools or []), *orchestrator_tools],
         )
 
     def set_worker_event_callback(self, callback: Callable[[AgentEvent], None]) -> None:
@@ -84,6 +85,33 @@ class OrchestratedAgentLoop:
             return result or f"{worker_name} completed the task."
 
         return delegate
+    
+    def _make_delegate_tool_for_worker(self, worker_name: str, worker: Agent) -> type[Tool]:
+        tool_name = f"ToolDelegateTo{worker_name.title().replace('-', '')}"
+        description = (
+            f"Delegate a task to `{worker_name}` worker. "
+            f"{self._worker_descriptions[worker_name]}"
+        )
+        return create_tool_delegate_to_agent(
+            tool_name=tool_name,
+            description=description,
+            delegate=self._build_delegate(worker_name, worker),
+        )
+
+    def add_worker(self, config: WorkerConfig) -> None:
+        worker = Agent(
+            name=config.name,
+            model=self.orchestrator.model,
+            system_prompt=config.system_prompt,
+            tools=config.tools,
+        )
+        self.workers[config.name] = worker
+        self._worker_descriptions[config.name] = config.description
+
+        delegate_tool = self._make_delegate_tool_for_worker(config.name, worker)
+        # dynamically add tool to orchestrator agent
+        self.orchestrator.add_tool(delegate_tool)
+
 
     async def run(self):
         async for event in self.orchestrator.run():

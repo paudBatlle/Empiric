@@ -210,6 +210,35 @@ class Agent:
                         "content": result,
                     }
                 )
+    
+    def _rebuild_tool_metadata(self) -> None:
+        self.available_tools = [
+            {
+                "name": tool.__name__,
+                "description": tool.__doc__ or "",
+                "input_schema": tool.model_json_schema(),
+            }
+            for tool in self.tools
+        ]
+        self.available_tools_ollama = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.__name__,
+                    "description": tool.__doc__ or "",
+                    "parameters": tool.model_json_schema(),
+                },
+            }
+            for tool in self.tools
+        ]
+
+    def __post_init__(self):
+        self._rebuild_tool_metadata()
+        self.ollama_messages.append({"role": "system", "content": self.system_prompt})
+
+    def add_tool(self, tool: type["Tool"]) -> None:
+        self.tools.append(tool)
+        self._rebuild_tool_metadata()
 
     async def agentic_loop(self) -> AsyncGenerator[AgentEvent, None]:
         if self._is_ollama_model():
