@@ -1,56 +1,19 @@
 import asyncio
-import subprocess
 
 from agent import EventText, EventToolResult, EventToolUse
-from orchestrator import OrchestratedAgentLoop, WorkerConfig
+from app_runtime import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_OLLAMA_MODEL,
+    build_model_name,
+    create_orchestrated_loop,
+    warmup_ollama_if_needed,
+)
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.status import Status
-from tools import (
-    ToolRunCommandInDevContainer,
-    ToolUpsertFile,
-    create_tool_ask_user,
-    create_tool_display_to_user,
-    start_python_dev_container,
-)
-
-
-ORCHESTRATOR_SYSTEM_PROMPT = """
-You are the orchestrator of a multi-agent coding system.
-Your role is to:
-1) Understand the user request.
-2) Delegate specific sub-tasks to worker agents with delegation tools.
-3) Combine worker outputs into a final clear answer.
-
-Guidelines:
-- Break large requests into small tasks before delegation.
-- Delegate coding/file writing to coder.
-- Delegate command execution/testing to runner.
-- Prefer delegating first, then synthesizing results.
-- If details are missing, ask the user directly.
-- Use ToolDisplayToUser for one-way progress updates.
-- Use ToolAskUser only when a user response is required.
-- Do not claim a task is done unless a worker confirmed it.
-"""
-
-CODER_SYSTEM_PROMPT = """
-You are a coding worker.
-Focus on implementing code changes and file updates.
-Use file editing tools when needed and return concise implementation notes.
-"""
-
-RUNNER_SYSTEM_PROMPT = """
-You are a command runner worker.
-Focus on executing commands, running checks/tests, and reporting outputs.
-Do not edit files unless explicitly asked.
-"""
-
-PLANNER_SYSTEM_PROMPT = """
-You are a planner worker.
-Focus on making a detailed plan on how to accomplish the user task.
-"""
+from tools import start_python_dev_container
 
 
 async def get_prompt_from_user(query: str) -> str:
@@ -72,76 +35,20 @@ def choose_model() -> str:
         .lower()
     )
     if provider == "ollama":
-        model_name = input("Ollama model name (default: llama3.1): ").strip()
-        return f"ollama:{model_name or 'llama3.1'}"
+        model_name = input(f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL}): ").strip()
+        return build_model_name("ollama", model_name)
 
-    claude_model = input(
-        "Claude model name (default: claude-3-5-sonnet-latest): "
-    ).strip()
-    return claude_model or "claude-3-5-sonnet-latest"
-
-
-def warmup_ollama_if_needed(model: str) -> None:
-    if not model.startswith("ollama:"):
-        return
-
-    ollama_model = model.split(":", 1)[1]
-    print(f"Starting Ollama model with `ollama run {ollama_model}`...")
-    try:
-        # Run once with a short prompt so Ollama spins up the selected model.
-        subprocess.run(
-            ["ollama", "run", ollama_model, "reply with ok"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "Ollama CLI was not found. Install Ollama and make sure `ollama` is in PATH."
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        raise RuntimeError(
-            f"Failed to start Ollama model `{ollama_model}` with `ollama run`: {stderr}"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"`ollama run {ollama_model}` timed out while starting the model."
-        ) from exc
+    claude_model = input(f"Claude model name (default: {DEFAULT_CLAUDE_MODEL}): ").strip()
+    return build_model_name("claude", claude_model)
 
 
 async def main():
     selected_model = choose_model()
     warmup_ollama_if_needed(selected_model)
-    ToolAskUser = create_tool_ask_user(get_prompt_from_user)
-    ToolDisplayToUser = create_tool_display_to_user(display_message_to_user)
-    workers = [
-        WorkerConfig(
-            name="coder",
-            description="Can write and edit files.",
-            system_prompt=CODER_SYSTEM_PROMPT,
-            tools=[ToolUpsertFile, ToolDisplayToUser, ToolAskUser],
-        ),
-        WorkerConfig(
-            name="runner",
-            description="Can run shell commands inside the dev container.",
-            system_prompt=RUNNER_SYSTEM_PROMPT,
-            tools=[ToolRunCommandInDevContainer, ToolDisplayToUser, ToolAskUser],
-        ),
-        WorkerConfig(
-            name="planner",
-            description="Makes a plan on how to accomplish the user task.",
-            system_prompt=PLANNER_SYSTEM_PROMPT,
-            tools=[ToolDisplayToUser, ToolAskUser],
-        ),
-    ]
-    # Initialize with predefined workers
-    loop = OrchestratedAgentLoop(
+    loop = create_orchestrated_loop(
         model=selected_model,
-        orchestrator_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
-        workers=workers,
-        shared_tools=[ToolDisplayToUser, ToolAskUser],
+        ask_user=get_prompt_from_user,
+        display_to_user=display_message_to_user,
     )
     loop.set_worker_event_callback(
         lambda event: (
@@ -150,7 +57,7 @@ async def main():
                 Markdown(
                     f"## Source\n`{event.source}`\n\n"
                     f"## Tool\n`{event.tool.__class__.__name__}`\n\n"
-                    f"## Args\n\n{event.tool.model_dump_json(indent=2)}\n```"
+                    f"## Args\n```json\n{event.tool.model_dump_json(indent=2)}\n```"
                 ),
                 title="Worker Tool Call",
                 border_style="magenta",
@@ -172,8 +79,11 @@ async def main():
     )
     )
 
-    start_python_dev_container("python-dev")
     console = Console()
+    try:
+        start_python_dev_container("python-dev")
+    except RuntimeError as exc:
+        console.print(f"[yellow]Warning: Docker tools unavailable: {exc}[/yellow]")
     status = Status("")
 
     while True:

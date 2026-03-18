@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Type
 from docker import errors as docker_errors
 from pydantic import BaseModel, Field
 
-from clients import docker_client
+from clients import get_docker_client
 
 if TYPE_CHECKING:
     # Imported only for type checking to avoid circular import at runtime.
@@ -24,6 +24,10 @@ class ToolRunCommandInDevContainer(Tool):
     command: str
 
     def _run(self) -> str:
+        try:
+            docker_client = get_docker_client()
+        except RuntimeError as exc:
+            return f"Error: {exc}"
         container = docker_client.containers.get("python-dev")
         exec_command = f"bash -c '{self.command}'"
 
@@ -46,6 +50,10 @@ class ToolUpsertFile(Tool):
     content: str = Field(description="Full file content")
 
     def _run(self) -> str:
+        try:
+            docker_client = get_docker_client()
+        except RuntimeError as exc:
+            return f"Error: {exc}"
         container = docker_client.containers.get("python-dev")
         cmd = f'sh -c "cat > {self.file_path}"'
         _, socket = container.exec_run(
@@ -61,6 +69,7 @@ class ToolUpsertFile(Tool):
 
 def start_python_dev_container(container_name: str) -> None:
     """Start a fresh Python development container."""
+    docker_client = get_docker_client()
     try:
         existing_container = docker_client.containers.get(container_name)
         if existing_container.status == "running":

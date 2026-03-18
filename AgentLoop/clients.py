@@ -7,13 +7,29 @@ from urllib import error, request
 
 import anthropic
 import docker
+from docker import errors as docker_errors
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
 anthropic_client = anthropic.AsyncAnthropic()
-docker_client = docker.from_env()
+_docker_client = None
+
+
+def get_docker_client():
+    global _docker_client
+    if _docker_client is not None:
+        return _docker_client
+
+    try:
+        _docker_client = docker.from_env()
+        return _docker_client
+    except docker_errors.DockerException as exc:
+        raise RuntimeError(
+            "Docker is unavailable or misconfigured. "
+            "Please start Docker Desktop (or fix DOCKER_HOST) and retry."
+        ) from exc
 
 
 @dataclass

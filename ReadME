@@ -1,0 +1,88 @@
+# Empiric Agent Loop
+
+Empiric is a multi-agent coding assistant runtime with two interfaces:
+- a developer-friendly terminal UI
+- a non-technical desktop UI (Tkinter)
+
+Both interfaces use the same orchestration backend and tool system.
+
+## What the project does
+
+The system runs an **orchestrator agent** that delegates work to specialized workers:
+- **coder**: writes/updates files
+- **runner**: runs shell commands in a Docker dev container
+- **planner**: drafts implementation plans
+
+The orchestrator decides which worker to call, collects tool results, and returns a final response.
+
+## How it works
+
+Core modules:
+- `AgentLoop/agent.py`: generic agent loop, model calls, tool invocation, and event streaming
+- `AgentLoop/orchestrator.py`: multi-worker orchestration and delegation tool wiring
+- `AgentLoop/tools.py`: tool definitions (run command, write file, ask/display user, dynamic worker creation)
+- `AgentLoop/app_runtime.py`: shared runtime setup for prompts, workers, model defaults, and loop creation
+- `AgentLoop/ui.py`: terminal interface
+- `AgentLoop/ui_desktop.py`: desktop chat interface (simple non-terminal UI)
+
+Execution flow:
+1. UI collects user input.
+2. Orchestrator receives the request.
+3. Orchestrator delegates subtasks to workers via tools.
+4. Workers run tools (including Docker-backed command/file tools when needed).
+5. Results stream back through events and are rendered in the UI.
+
+## Model providers
+
+Supported providers:
+- **Claude** (default)
+- **Ollama** (`ollama:<model_name>`, e.g. `ollama:llama3.1`)
+
+If Ollama is selected, the runtime performs a warmup call using `ollama run`.
+
+## Requirements
+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) (recommended and expected runtime)
+- Docker Desktop (only required for Docker-backed tools)
+- Optional: Ollama CLI + local Ollama server when using Ollama models
+
+## Setup
+
+From repository root:
+
+```bash
+uv sync
+```
+
+Create a `.env` file with required credentials (for example, Anthropic API key if using Claude).
+
+## Run
+
+Always run with `uv run` to use the locked project environment from `uv.lock`.
+
+Terminal UI:
+
+```bash
+uv run python AgentLoop/ui.py
+```
+
+Desktop UI:
+
+```bash
+uv run python AgentLoop/ui_desktop.py
+```
+
+## Docker notes
+
+- Docker-backed tools use a container named `python-dev`.
+- If Docker is unavailable or misconfigured, the UI still starts and shows a warning.
+- In that state, Docker-backed tools return clear error messages instead of crashing startup.
+
+## Troubleshooting
+
+If you see Docker connection errors like `http+docker`:
+- make sure you are running with `uv run` (not Conda/system Python)
+- ensure Docker Desktop is running
+- verify Docker works in your shell: `docker ps`
+- if needed, check `DOCKER_HOST` / `DOCKER_CONTEXT` environment variables
