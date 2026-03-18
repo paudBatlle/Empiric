@@ -3,7 +3,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any
-from urllib import request
+from urllib import error, request
 
 import anthropic
 import docker
@@ -19,7 +19,7 @@ docker_client = docker.from_env()
 @dataclass
 class AsyncOllamaClient:
     base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    timeout_seconds: int = 120
+    timeout_seconds: int = 300
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
@@ -30,9 +30,23 @@ class AsyncOllamaClient:
             method="POST",
         )
 
-        with request.urlopen(req, timeout=self.timeout_seconds) as resp:
-            data = resp.read().decode("utf-8")
-            return json.loads(data)
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                data = resp.read().decode("utf-8")
+                return json.loads(data)
+        except error.HTTPError as e:
+            # Surface Ollama server errors as structured responses instead of crashing the agent loop.
+            return {
+                "error": "HTTPError",
+                "status": e.code,
+                "reason": e.reason,
+                "body": e.read().decode("utf-8", errors="ignore"),
+            }
+        except error.URLError as e:
+            return {
+                "error": "URLError",
+                "reason": str(e.reason),
+            }
 
     async def chat(
         self,

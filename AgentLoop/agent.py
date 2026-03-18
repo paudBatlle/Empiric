@@ -3,6 +3,7 @@ import json
 from typing import Any, AsyncGenerator
 
 from anthropic.types import MessageParam, ToolResultBlockParam, ToolUnionParam
+from pydantic import ValidationError
 from tenacity import AsyncRetrying, stop_after_attempt, wait_fixed
 
 from clients import anthropic_client, ollama_client
@@ -84,6 +85,37 @@ class Agent:
     def _ollama_model_name(self) -> str:
         return self.model.split(":", 1)[1] if self._is_ollama_model() else self.model
 
+    @staticmethod
+    def _tool_argument_error_result(
+        *,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        validation_error: ValidationError,
+        schema: dict[str, Any],
+    ) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error_type": "tool_argument_validation_error",
+                "tool_name": tool_name,
+                "message": "Tool arguments failed schema validation. Retry with corrected arguments.",
+                "received_arguments": tool_args,
+                "required_fields": schema.get("required", []),
+                "validation_errors": validation_error.errors(),
+            }
+        )
+
+    @staticmethod
+    def _tool_not_available_result(*, tool_name: str) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error_type": "tool_not_available",
+                "tool_name": tool_name,
+                "message": f"Tool `{tool_name}` is not available. Pick one of the declared tools.",
+            }
+        )
+
     async def _run_tool(
         self, tool_name: str, tool_args: dict[str, Any]
     ) -> AsyncGenerator[AgentEvent, None]:
@@ -91,15 +123,46 @@ class Agent:
             if tool.__name__ != tool_name:
                 continue
 
-            t = tool.model_validate(tool_args)
+            try:
+                t = tool.model_validate(tool_args)
+            except ValidationError as exc:
+                structured_error = self._tool_argument_error_result(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    validation_error=exc,
+                    schema=tool.model_json_schema(),
+                )
+                yield EventText(
+                    source=self.name,
+                    text=(
+                        f"Tool `{tool_name}` argument validation failed. "
+                        "Returning structured error so the model can retry."
+                    ),
+                )
+                # Use model_construct so UI/debug output can still show a tool instance.
+                invalid_tool_call = tool.model_construct(**tool_args)
+                yield EventToolResult(
+                    source=self.name, tool=invalid_tool_call, result=structured_error
+                )
+                return
+
             yield EventToolUse(source=self.name, tool=t)
             result = await t()
             yield EventToolResult(source=self.name, tool=t, result=result)
             return
 
+        structured_error = self._tool_not_available_result(tool_name=tool_name)
         yield EventText(
             source=self.name,
-            text=f"Tool `{tool_name}` was requested but is not available.",
+            text=(
+                f"Tool `{tool_name}` was requested but is not available. "
+                "Returning structured error so the model can retry."
+            ),
+        )
+        yield EventToolResult(
+            source=self.name,
+            tool=Tool.model_construct(),
+            result=structured_error,
         )
         return
 
@@ -141,11 +204,58 @@ class Agent:
                 if tool.__name__ != tool_name:
                     continue
 
-                t = tool.model_validate(tool_args)
-                yield EventToolUse(source=self.name, tool=t)
-                result = await t()
-                yield EventToolResult(source=self.name, tool=t, result=result)
+                try:
+                    t = tool.model_validate(tool_args)
+                except ValidationError as exc:
+                    result = self._tool_argument_error_result(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        validation_error=exc,
+                        schema=tool.model_json_schema(),
+                    )
+                    yield EventText(
+                        source=self.name,
+                        text=(
+                            f"Tool `{tool_name}` argument validation failed. "
+                            "Returning structured error so the model can retry."
+                        ),
+                    )
+                    invalid_tool_call = tool.model_construct(**tool_args)
+                    yield EventToolResult(
+                        source=self.name, tool=invalid_tool_call, result=result
+                    )
+                else:
+                    yield EventToolUse(source=self.name, tool=t)
+                    result = await t()
+                    yield EventToolResult(source=self.name, tool=t, result=result)
 
+                self.messages.append(
+                    MessageParam(
+                        role="user",
+                        content=[
+                            ToolResultBlockParam(
+                                type="tool_result",
+                                tool_use_id=content.id,
+                                content=result,
+                            )
+                        ],
+                    )
+                )
+                break
+            else:
+                result = self._tool_not_available_result(tool_name=tool_name)
+                yield EventText(
+                    source=self.name,
+                    text=(
+                        f"Tool `{tool_name}` was requested but is not available. "
+                        "Returning structured error so the model can retry."
+                    ),
+                )
+                yield EventToolResult(
+                    source=self.name,
+                    tool=Tool.model_construct(),
+                    result=result,
+                )
                 self.messages.append(
                     MessageParam(
                         role="user",
@@ -171,6 +281,25 @@ class Agent:
                 tools=self.available_tools_ollama,
                 stream=False,
             )
+            # Handle network / server errors from Ollama gracefully.
+            if isinstance(response, dict) and response.get("error"):
+                error_type = response.get("error")
+                status = response.get("status")
+                reason = response.get("reason")
+                body = response.get("body")
+                details = f"{error_type}"
+                if status is not None:
+                    details += f" (status {status})"
+                if reason:
+                    details += f": {reason}"
+                if body:
+                    details += f"\nResponse body: {body}"
+                yield EventText(
+                    source=self.name,
+                    text=f"Ollama request failed: {details}",
+                )
+                break
+
             message = response.get("message", {})
             text = (message.get("content") or "").strip()
             if text:

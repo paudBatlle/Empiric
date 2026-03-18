@@ -11,7 +11,8 @@ from rich.status import Status
 from tools import (
     ToolRunCommandInDevContainer,
     ToolUpsertFile,
-    create_tool_interact_with_user,
+    create_tool_ask_user,
+    create_tool_display_to_user,
     start_python_dev_container,
 )
 
@@ -29,6 +30,8 @@ Guidelines:
 - Delegate command execution/testing to runner.
 - Prefer delegating first, then synthesizing results.
 - If details are missing, ask the user directly.
+- Use ToolDisplayToUser for one-way progress updates.
+- Use ToolAskUser only when a user response is required.
 - Do not claim a task is done unless a worker confirmed it.
 """
 
@@ -44,12 +47,22 @@ Focus on executing commands, running checks/tests, and reporting outputs.
 Do not edit files unless explicitly asked.
 """
 
+PLANNER_SYSTEM_PROMPT = """
+You are a planner worker.
+Focus on making a detailed plan on how to accomplish the user task.
+"""
+
 
 async def get_prompt_from_user(query: str) -> str:
     print()
     answer = input(f"User input needed:\n{query}\n\nUser: ")
     print()
     return answer
+
+
+async def display_message_to_user(text: str) -> None:
+    print()
+    print(f"Agent message:\n{text}\n")
 
 
 def choose_model() -> str:
@@ -101,25 +114,26 @@ def warmup_ollama_if_needed(model: str) -> None:
 async def main():
     selected_model = choose_model()
     warmup_ollama_if_needed(selected_model)
-    ToolInteractWithUser = create_tool_interact_with_user(get_prompt_from_user)
+    ToolAskUser = create_tool_ask_user(get_prompt_from_user)
+    ToolDisplayToUser = create_tool_display_to_user(display_message_to_user)
     workers = [
         WorkerConfig(
             name="coder",
             description="Can write and edit files.",
             system_prompt=CODER_SYSTEM_PROMPT,
-            tools=[ToolUpsertFile, ToolInteractWithUser],
+            tools=[ToolUpsertFile, ToolDisplayToUser, ToolAskUser],
         ),
         WorkerConfig(
             name="runner",
             description="Can run shell commands inside the dev container.",
             system_prompt=RUNNER_SYSTEM_PROMPT,
-            tools=[ToolRunCommandInDevContainer, ToolInteractWithUser],
+            tools=[ToolRunCommandInDevContainer, ToolDisplayToUser, ToolAskUser],
         ),
         WorkerConfig(
-            name="runner",
-            description="Can run shell commands inside the dev container.",
-            system_prompt=RUNNER_SYSTEM_PROMPT,
-            tools=[ToolRunCommandInDevContainer, ToolInteractWithUser],
+            name="planner",
+            description="Makes a plan on how to accomplish the user task.",
+            system_prompt=PLANNER_SYSTEM_PROMPT,
+            tools=[ToolDisplayToUser, ToolAskUser],
         ),
     ]
     # Initialize with predefined workers
@@ -127,22 +141,35 @@ async def main():
         model=selected_model,
         orchestrator_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
         workers=workers,
-        shared_tools=[ToolInteractWithUser],
+        shared_tools=[ToolDisplayToUser, ToolAskUser],
     )
     loop.set_worker_event_callback(
         lambda event: (
-            print(
-                f"\n[worker:{event.source}] tool -> {event.tool.__class__.__name__}",
-                flush=True,
+            console.print(
+            Panel(
+                Markdown(
+                    f"## Source\n`{event.source}`\n\n"
+                    f"## Tool\n`{event.tool.__class__.__name__}`\n\n"
+                    f"## Args\n\n{event.tool.model_dump_json(indent=2)}\n```"
+                ),
+                title="Worker Tool Call",
+                border_style="magenta",
             )
-            if isinstance(event, EventToolUse)
-            else print(
-                f"\n[worker:{event.source}] tool result -> {event.result[:120]}",
-                flush=True,
-            )
-            if isinstance(event, EventToolResult)
-            else None
         )
+        if isinstance(event, EventToolUse)
+        else console.print(
+            Panel(
+                Markdown(
+                    f"## Source\n`{event.source}`\n\n"
+                    f"## Result\n{(event.result or '')[:400]}"
+                ),
+                title="Worker Tool Result",
+                border_style="magenta",
+            )
+        )
+        if isinstance(event, EventToolResult)
+        else None
+    )
     )
 
     start_python_dev_container("python-dev")

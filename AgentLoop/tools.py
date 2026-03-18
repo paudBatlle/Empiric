@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 import asyncio
 from pathlib import Path
-from typing import Awaitable, Callable, Type
+from typing import TYPE_CHECKING, Awaitable, Callable, Type
 
 from docker import errors as docker_errors
 from pydantic import BaseModel, Field
 
 from clients import docker_client
 
+if TYPE_CHECKING:
+    # Imported only for type checking to avoid circular import at runtime.
+    from orchestrator import OrchestratedAgentLoop
 
 class Tool(BaseModel):
     async def __call__(self) -> str:
@@ -79,21 +84,40 @@ def start_python_dev_container(container_name: str) -> None:
     )
 
 
-def create_tool_interact_with_user(
+def create_tool_display_to_user(
+    displayer: Callable[[str], Awaitable[None]],
+) -> Type[Tool]:
+    class ToolDisplayToUser(Tool):
+        """Display information to the user without waiting for input."""
+
+        text: str = Field(description="Text to display to the user")
+
+        async def __call__(self) -> str:
+            await displayer(self.text)
+            return "Displayed message to user."
+
+    return ToolDisplayToUser
+
+
+def create_tool_ask_user(
     prompter: Callable[[str], Awaitable[str]],
 ) -> Type[Tool]:
-    class ToolInteractWithUser(Tool):
-        """Ask the user for missing information."""
+    class ToolAskUser(Tool):
+        """Ask the user for missing information and wait for a reply."""
 
         query: str = Field(description="Question to ask the user")
-        display: str = Field(
-            description="Optional markdown artifact to display while waiting for user input"
-        )
 
         async def __call__(self) -> str:
             return await prompter(self.query)
 
-    return ToolInteractWithUser
+    return ToolAskUser
+
+
+def create_tool_interact_with_user(
+    prompter: Callable[[str], Awaitable[str]],
+) -> Type[Tool]:
+    """Backward-compatible alias for ask-user behavior."""
+    return create_tool_ask_user(prompter)
 
 
 def create_tool_delegate_to_agent(
@@ -128,7 +152,7 @@ def create_tool_add_worker(loop: OrchestratedAgentLoop) -> Type[Tool]:
 
         async def __call__(self) -> str:
             # map tool_names -> actual Tool classes
-            from agentLoop import tools as tools_module  # or wherever your tools live
+            import tools as tools_module
 
             available_tool_classes: dict[str, type[Tool]] = {
                 cls.__name__: cls
@@ -151,3 +175,5 @@ def create_tool_add_worker(loop: OrchestratedAgentLoop) -> Type[Tool]:
             return f"Worker `{self.name}` created with tools: {[t.__name__ for t in selected_tools]}"
 
     return ToolAddWorker
+
+
