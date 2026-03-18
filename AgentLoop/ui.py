@@ -2,6 +2,7 @@ import asyncio
 
 from agent import EventText, EventToolResult, EventToolUse
 from app_runtime import (
+    DEFAULT_PROVIDER,
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_OLLAMA_MODEL,
     build_model_name,
@@ -30,10 +31,11 @@ async def display_message_to_user(text: str) -> None:
 
 def choose_model() -> str:
     provider = (
-        input("Choose model provider [claude/ollama] (default: claude): ")
+        input(f"Choose model provider [claude/ollama] (default: {DEFAULT_PROVIDER}): ")
         .strip()
         .lower()
     )
+    provider = provider or DEFAULT_PROVIDER
     if provider == "ollama":
         model_name = input(f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL}): ").strip()
         return build_model_name("ollama", model_name)

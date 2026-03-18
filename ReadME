@@ -1,10 +1,6 @@
 # Empiric Agent Loop
 
-Empiric is a multi-agent coding assistant runtime with two interfaces:
-- a developer-friendly terminal UI
-- a non-technical desktop UI (Tkinter)
-
-Both interfaces use the same orchestration backend and tool system.
+Empiric is a multi-agent coding assistant runtime with a React-first UI and Python orchestration backend.
 
 ## What the project does
 
@@ -15,36 +11,34 @@ The system runs an **orchestrator agent** that delegates work to specialized wor
 
 The orchestrator decides which worker to call, collects tool results, and returns a final response.
 
-## How it works
+## Interfaces
+
+- **Default UI**: React web app (`frontend/`) + Python WebSocket backend (`AgentLoop/ui_web.py`)
+- **Fallback UI**: terminal interface (`AgentLoop/ui.py`)
+- **Fallback UI**: desktop Tkinter interface (`AgentLoop/ui_desktop.py`)
+
+## Architecture
 
 Core modules:
 - `AgentLoop/agent.py`: generic agent loop, model calls, tool invocation, and event streaming
 - `AgentLoop/orchestrator.py`: multi-worker orchestration and delegation tool wiring
 - `AgentLoop/tools.py`: tool definitions (run command, write file, ask/display user, dynamic worker creation)
 - `AgentLoop/app_runtime.py`: shared runtime setup for prompts, workers, model defaults, and loop creation
-- `AgentLoop/ui.py`: terminal interface
-- `AgentLoop/ui_desktop.py`: desktop chat interface (simple non-terminal UI)
+- `AgentLoop/ui_web.py`: FastAPI + WebSocket bridge for the React UI
+- `frontend/src/App.jsx`: React chat interface
 
 Execution flow:
-1. UI collects user input.
-2. Orchestrator receives the request.
-3. Orchestrator delegates subtasks to workers via tools.
-4. Workers run tools (including Docker-backed command/file tools when needed).
-5. Results stream back through events and are rendered in the UI.
-
-## Model providers
-
-Supported providers:
-- **Claude** (default)
-- **Ollama** (`ollama:<model_name>`, e.g. `ollama:llama3.1`)
-
-If Ollama is selected, the runtime performs a warmup call using `ollama run`.
+1. React UI sends messages via WebSocket (`/ws`).
+2. Python backend forwards requests to `create_orchestrated_loop(...)`.
+3. Worker/orchestrator events stream back as UI events (`text`, `tool_use`, `tool_result`, `ask_user`, `done`).
+4. UI renders responses, tool cards, and ask-user prompts.
 
 ## Requirements
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended and expected runtime)
-- Docker Desktop (only required for Docker-backed tools)
+- Node.js 20+
+- Docker Desktop (required only for Docker-backed tools)
 - Optional: Ollama CLI + local Ollama server when using Ollama models
 
 ## Setup
@@ -55,11 +49,63 @@ From repository root:
 uv sync
 ```
 
+From `frontend/`:
+
+```bash
+npm install
+```
+
 Create a `.env` file with required credentials (for example, Anthropic API key if using Claude).
 
-## Run
+## Run (Default React UI)
 
-Always run with `uv run` to use the locked project environment from `uv.lock`.
+For non-technical users on macOS (recommended):
+
+1. Double-click `launch_empiric.command` in Finder.
+2. A Terminal window opens and starts Empiric automatically.
+3. Your browser opens to `http://127.0.0.1:5173`.
+
+Keep that Terminal window open while using the app.
+
+Option 1 (single command, from `frontend/`):
+
+```bash
+npm run dev:all
+```
+
+Option 2 (split terminals):
+
+Backend (from repository root):
+
+```bash
+uv run python AgentLoop/ui_web.py
+```
+
+Frontend (from `frontend/`):
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+## Production-style static build
+
+Build frontend:
+
+```bash
+cd frontend && npm run build
+```
+
+Run backend serving built assets:
+
+```bash
+uv run python AgentLoop/ui_web.py
+```
+
+Then open `http://localhost:8000`.
+
+## Fallback UIs
 
 Terminal UI:
 

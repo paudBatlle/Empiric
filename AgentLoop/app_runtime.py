@@ -9,9 +9,9 @@ from tools import (
     create_tool_display_to_user,
 )
 
-DEFAULT_PROVIDER = "claude"
+DEFAULT_PROVIDER = "ollama"
 DEFAULT_CLAUDE_MODEL = "claude-3-5-sonnet-latest"
-DEFAULT_OLLAMA_MODEL = "llama3.1"
+DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
 
 ORCHESTRATOR_SYSTEM_PROMPT = """
 You are the orchestrator of a multi-agent coding system.
