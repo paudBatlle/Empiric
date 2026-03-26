@@ -79,6 +79,23 @@ class Agent:
         self.messages.append(MessageParam(role="user", content=message))
         self.ollama_messages.append({"role": "user", "content": message})
 
+    def reset_context(self) -> None:
+        self.messages = []
+        self.ollama_messages = [{"role": "system", "content": self.system_prompt}]
+
+    def load_context(self, turns: list[dict[str, Any]]) -> None:
+        self.reset_context()
+        for turn in turns:
+            role = str(turn.get("role", "")).strip()
+            content = str(turn.get("content", ""))
+            if role not in {"user", "assistant", "system"}:
+                continue
+            if role == "system":
+                # Keep canonical system prompt as source of truth.
+                continue
+            self.messages.append(MessageParam(role=role, content=content))
+            self.ollama_messages.append({"role": role, "content": content})
+
     def _is_ollama_model(self) -> bool:
         return self.model.startswith("ollama:")
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from agent import Agent, AgentEvent, EventText, EventToolResult, EventToolUse
 from tools import Tool, create_tool_delegate_to_agent, create_tool_add_worker
@@ -63,6 +63,9 @@ class OrchestratedAgentLoop:
 
     def add_user_message(self, message: str):
         self.orchestrator.add_user_message(message)
+
+    def reset_and_load_context(self, turns: list[dict[str, Any]]) -> None:
+        self.orchestrator.load_context(turns)
 
     def _build_delegate(self, worker_name: str, worker: Agent):
         async def delegate(task: str) -> str:

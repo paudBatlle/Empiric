@@ -1,0 +1,12 @@
+- Improve UI to also show the ask for user input tool in the chat tpgether with the response
+- Add more tools
+    - Email (Gmail,Outlook), Calendar, 
+    - File Storage (Computer)
+- Add memory
+- Check Docker env connection
+- Stop button
+
+issues
+
+- When orchatrator uses tool diplasy to user, the message shows 2 times
+- flickering ai message when typing

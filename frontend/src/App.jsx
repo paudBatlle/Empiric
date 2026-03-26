@@ -6,28 +6,70 @@ function useAgent() {
   const reconnectTimer = useRef(null);
   const reconnectAttempt = useRef(0);
   const shouldReconnect = useRef(true);
+  const activeLeafIdRef = useRef(null);
+  const nodesByIdRef = useRef({});
   const [connected, setConnected] = useState(false);
-  const [messages, setMessages] = useState([]);
+  const [nodesById, setNodesById] = useState({});
+  const [activeLeafId, setActiveLeafId] = useState(null);
   const [thinking, setThinking] = useState(false);
   const [askQuery, setAskQuery] = useState(null);
+  const [lastBranchBaseId, setLastBranchBaseId] = useState(null);
 
-  const push = useCallback(
-    (msg) => setMessages((prev) => [...prev, { id: Date.now() + Math.random(), ...msg }]),
-    []
-  );
+  const makeId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  useEffect(() => {
+    activeLeafIdRef.current = activeLeafId;
+  }, [activeLeafId]);
+
+  useEffect(() => {
+    nodesByIdRef.current = nodesById;
+  }, [nodesById]);
+
+  const appendNode = useCallback((msg, parentIdOverride = undefined) => {
+    const id = makeId();
+    setNodesById((prev) => {
+      const parentId = parentIdOverride === undefined ? activeLeafIdRef.current : parentIdOverride;
+      const next = {
+        ...prev,
+        [id]: { id, parentId: parentId ?? null, createdAt: new Date().toISOString(), ...msg },
+      };
+      nodesByIdRef.current = next;
+      return next;
+    });
+    setActiveLeafId(id);
+    return id;
+  }, []);
 
   // Attach a tool_result to the most recent pending tool_use
   const attachResult = useCallback(
     (result) =>
-      setMessages((prev) => {
-        const copy = [...prev];
-        for (let i = copy.length - 1; i >= 0; i--) {
-          if (copy[i].role === "tool_use" && copy[i].result === undefined) {
-            copy[i] = { ...copy[i], result, resultTs: new Date() };
-            return copy;
+      setNodesById((prev) => {
+        let cursor = activeLeafIdRef.current;
+        while (cursor && prev[cursor]) {
+          const n = prev[cursor];
+          if (n.role === "tool_use" && n.result === undefined) {
+            const next = {
+              ...prev,
+              [cursor]: { ...n, result, resultTs: new Date().toISOString() },
+            };
+            nodesByIdRef.current = next;
+            return next;
           }
+          cursor = n.parentId;
         }
-        return [...prev, { id: Date.now() + Math.random(), role: "tool_result", result }];
+        const id = makeId();
+        const next = {
+          ...prev,
+          [id]: {
+            id,
+            parentId: activeLeafIdRef.current ?? null,
+            createdAt: new Date().toISOString(),
+            role: "tool_result",
+            result,
+          },
+        };
+        nodesByIdRef.current = next;
+        return next;
       }),
     []
   );
@@ -77,29 +119,29 @@ function useAgent() {
           break;
         case "text":
           setThinking(false);
-          push({ role: "assistant", text: msg.text, source: msg.source });
+          appendNode({ role: "assistant", text: msg.text, source: msg.source });
           break;
         case "tool_use":
-          push({ role: "tool_use", source: msg.source, tool: msg.tool, ts: new Date() });
+          appendNode({ role: "tool_use", source: msg.source, tool: msg.tool, ts: new Date().toISOString() });
           break;
         case "tool_result":
           attachResult(msg.result);
           break;
         case "display":
-          push({ role: "assistant", text: msg.text });
+          appendNode({ role: "assistant", text: msg.text });
           break;
         case "ask_user":
           setAskQuery(msg.query);
           break;
         case "system":
-          push({ role: "system", text: msg.text });
+          appendNode({ role: "system", text: msg.text });
           break;
         case "done":
           setThinking(false);
           break;
       }
     };
-  }, [push, attachResult, clearReconnectTimer]);
+  }, [appendNode, attachResult, clearReconnectTimer]);
 
   useEffect(() => {
     shouldReconnect.current = true;
@@ -120,7 +162,9 @@ function useAgent() {
 
   const startSession = useCallback(
     (provider, model) => {
-      setMessages([]);
+      setNodesById({});
+      setActiveLeafId(null);
+      setLastBranchBaseId(null);
       sendPacket({ type: "new_session", provider, model });
     },
     [sendPacket]
@@ -129,11 +173,14 @@ function useAgent() {
   const sendMessage = useCallback(
     (text) => {
       if (!text.trim()) return;
-      push({ role: "user", text });
+      if (!sendPacket({ type: "user_message", text })) {
+        appendNode({ role: "system", text: "Disconnected. Reconnecting - please resend your message." });
+        return;
+      }
+      appendNode({ role: "user", text });
       setThinking(true);
-      sendPacket({ type: "user_message", text });
     },
-    [push, sendPacket]
+    [appendNode, sendPacket]
   );
 
   const answerAsk = useCallback(
@@ -144,7 +191,58 @@ function useAgent() {
     [sendPacket]
   );
 
-  return { connected, messages, thinking, askQuery, startSession, sendMessage, answerAsk };
+  const activePathIds = [];
+  let cursor = activeLeafId;
+  while (cursor && nodesById[cursor]) {
+    activePathIds.push(cursor);
+    cursor = nodesById[cursor].parentId;
+  }
+  activePathIds.reverse();
+  const messages = activePathIds.map((id) => nodesById[id]).filter(Boolean);
+
+  const childrenByParent = {};
+  Object.values(nodesById).forEach((n) => {
+    const key = n.parentId ?? "__root__";
+    if (!childrenByParent[key]) childrenByParent[key] = [];
+    childrenByParent[key].push(n.id);
+  });
+  Object.values(childrenByParent).forEach((ids) => {
+    ids.sort((a, b) => new Date(nodesById[a].createdAt) - new Date(nodesById[b].createdAt));
+  });
+
+  const branchFrom = useCallback((baseId) => {
+    setLastBranchBaseId(baseId);
+    setActiveLeafId(baseId);
+  }, []);
+
+  const switchToNode = useCallback((id) => {
+    setActiveLeafId(id);
+  }, []);
+
+  const activePathPacket = messages
+    .filter((m) => ["user", "assistant", "system"].includes(m.role))
+    .map((m) => ({ role: m.role, content: m.text || "" }));
+
+  useEffect(() => {
+    if (!sendPacket || !connected || thinking) return;
+    sendPacket({ type: "set_active_path", path_messages: activePathPacket });
+  }, [connected, sendPacket, activeLeafId, thinking]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return {
+    connected,
+    messages,
+    thinking,
+    askQuery,
+    startSession,
+    sendMessage,
+    answerAsk,
+    branchFrom,
+    switchToNode,
+    childrenByParent,
+    activeLeafId,
+    lastBranchBaseId,
+    nodesById,
+  };
 }
 
 /* ── Thinking dots ───────────────────────────────────────────────────────── */
@@ -193,7 +291,7 @@ function ThinkingDots() {
 }
 
 /* ── Tool card – inline in the chat stream ───────────────────────────────── */
-function ToolCard({ msg }) {
+function ToolCard({ msg, childIds = [], activeLeafId, onSwitchToNode, onBranchFrom }) {
   const [expanded, setExpanded] = useState(false);
   const hasResult = msg.result !== undefined;
   const ts = msg.ts instanceof Date ? msg.ts : new Date(msg.ts || Date.now());
@@ -395,12 +493,32 @@ function ToolCard({ msg }) {
           </pre>
         </div>
       )}
+      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        <button onClick={() => onBranchFrom(msg.id)} style={ghostSt} title="Start a branch from this message">
+          Branch from here
+        </button>
+        {childIds.map((id, idx) => (
+          <button
+            key={id}
+            onClick={() => onSwitchToNode(id)}
+            style={{
+              ...ghostSt,
+              padding: "5px 10px",
+              fontSize: 11,
+              borderColor: activeLeafId === id ? "#c4622d" : "#ddd8ce",
+              color: activeLeafId === id ? "#c4622d" : "#6b6b63",
+            }}
+          >
+            Branch {idx + 1}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
 
 /* ── Chat bubble ─────────────────────────────────────────────────────────── */
-function Bubble({ msg, prevMsg }) {
+function Bubble({ msg, prevMsg, childIds = [], activeLeafId, onSwitchToNode, onBranchFrom }) {
   const isUser = msg.role === "user";
   const isSystem = msg.role === "system";
   const showMeta = prevMsg?.role !== msg.role;
@@ -466,6 +584,26 @@ function Bubble({ msg, prevMsg }) {
         }}
       >
         {msg.text}
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+        <button onClick={() => onBranchFrom(msg.id)} style={{ ...ghostSt, padding: "4px 10px", fontSize: 11 }}>
+          Branch from here
+        </button>
+        {childIds.map((id, idx) => (
+          <button
+            key={id}
+            onClick={() => onSwitchToNode(id)}
+            style={{
+              ...ghostSt,
+              padding: "4px 10px",
+              fontSize: 11,
+              borderColor: activeLeafId === id ? "#c4622d" : "#ddd8ce",
+              color: activeLeafId === id ? "#c4622d" : "#6b6b63",
+            }}
+          >
+            Branch {idx + 1}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -646,13 +784,51 @@ function AskModal({ query, onAnswer }) {
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
-function Sidebar({ messages, sessionCount, onNewSession }) {
+function Sidebar({
+  messages,
+  sessionCount,
+  onNewSession,
+  branches = [],
+  onSwitchToNode,
+  activeLeafId,
+  nodesById = {},
+  childrenByParent = {},
+}) {
   const [open, setOpen] = useState(true);
   const toolEvents = messages.filter((m) => m.role === "tool_use");
   const toolCounts = toolEvents.reduce((acc, e) => {
     acc[e.tool] = (acc[e.tool] || 0) + 1;
     return acc;
   }, {});
+  const roleGlyph = { user: "●", assistant: "◆", system: "■", tool_use: "▲", tool_result: "◉" };
+  const roleColor = {
+    user: "#4a8cca",
+    assistant: "#3d9e6e",
+    system: "#8d8d84",
+    tool_use: "#c4922d",
+    tool_result: "#7a74d1",
+  };
+  const rootIds = (childrenByParent["__root__"] || []).filter((id) => nodesById[id]);
+  const treeRows = [];
+  const walkTree = (nodeId, depth = 0, ancestorContinues = [], isLast = true) => {
+    const node = nodesById[nodeId];
+    if (!node) return;
+    const labelText = node.text || node.tool || node.role || "message";
+    const shortLabel = labelText.replace(/\s+/g, " ").slice(0, 26);
+    treeRows.push({
+      id: nodeId,
+      depth,
+      isLast,
+      ancestorContinues,
+      role: node.role,
+      text: shortLabel,
+    });
+    const kids = (childrenByParent[nodeId] || []).filter((id) => nodesById[id]);
+    kids.forEach((kidId, idx) => {
+      walkTree(kidId, depth + 1, [...ancestorContinues, !isLast], idx === kids.length - 1);
+    });
+  };
+  rootIds.forEach((rootId, idx) => walkTree(rootId, 0, [], idx === rootIds.length - 1));
 
   return (
     <aside
@@ -786,6 +962,120 @@ function Sidebar({ messages, sessionCount, onNewSession }) {
                 </div>
               ))
             )}
+            <div style={{ ...sideLabel, marginTop: 14 }}>Branches ({branches.length})</div>
+            {branches.length === 0 ? (
+              <p style={{ fontSize: 11, color: "#9c9c91", fontStyle: "italic" }}>No branches yet.</p>
+            ) : (
+              branches.map((b, idx) => (
+                <button
+                  key={b.leafId}
+                  onClick={() => onSwitchToNode(b.leafId)}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "5px 7px",
+                    marginBottom: 4,
+                    borderRadius: 6,
+                    border: b.leafId === activeLeafId ? "1px solid #c4622d" : "1px solid #ddd8ce",
+                    background: b.leafId === activeLeafId ? "#c4622d" : "#faf8f4",
+                    color: b.leafId === activeLeafId ? "#fff6ef" : "#6b6b63",
+                    fontSize: 11,
+                    cursor: "pointer",
+                  }}
+                  title={b.preview}
+                >
+                  B{idx + 1} · {b.preview}
+                </button>
+              ))
+            )}
+            <div style={{ ...sideLabel, marginTop: 12 }}>Message tree</div>
+            {
+              <div
+                style={{
+                  maxHeight: 220,
+                  overflowY: "auto", 
+                  border: "1px solid #ddd8ce",
+                  borderRadius: 6,
+                  background: "#fcfaf7",
+                  padding: 6,
+                }}
+              >
+                {treeRows.length === 0 ? (
+                  <p style={{ fontSize: 11, color: "#9c9c91", fontStyle: "italic", margin: 6 }}>No messages yet.</p>
+                ) : (
+                  treeRows.map((row) => (
+                    <button
+                      key={row.id}
+                      onClick={() => onSwitchToNode(row.id)}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        border: row.id === activeLeafId ? "1px solid #e5b79f" : "1px solid transparent",
+                        borderRadius: 4,
+                        background: row.id === activeLeafId ? "#f8ebe3" : "transparent",
+                        color: row.id === activeLeafId ? "#8f431c" : "#57574f",
+                        fontSize: 10.5,
+                        padding: "4px 6px",
+                        marginBottom: 2,
+                        cursor: "pointer",
+                        fontFamily: "'Source Sans 3','Helvetica Neue',sans-serif",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                      }}
+                      title={nodesById[row.id]?.text || nodesById[row.id]?.tool || nodesById[row.id]?.role || "message"}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", height: 14 }}>
+                        {row.depth > 0 &&
+                          Array.from({ length: row.depth }).map((_, i) => {
+                            const showVLine = row.ancestorContinues[i];
+                            return (
+                              <span
+                                key={i}
+                                style={{
+                                  width: 12,
+                                  height: 14,
+                                  borderLeft: showVLine ? "1px solid #d6cec0" : "1px solid transparent",
+                                  marginRight: 1,
+                                }}
+                              />
+                            );
+                          })}
+                        {row.depth > 0 && (
+                          <span
+                            style={{
+                              width: 12,
+                              height: 14,
+                              borderLeft: "1px solid #d6cec0",
+                              borderBottom: "1px solid #d6cec0",
+                              borderBottomLeftRadius: 4,
+                              marginRight: 2,
+                            }}
+                          />
+                        )}
+                      </span>
+                      <span
+                        style={{
+                          color: roleColor[row.role] || "#6b6b63",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          minWidth: 10,
+                        }}
+                      >
+                        {roleGlyph[row.role] || "•"}
+                      </span>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {row.id === activeLeafId ? "Current · " : ""}
+                        {row.text}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            }
           </div>
         </>
       )}
@@ -818,7 +1108,21 @@ const STYLES = `
 
 /* ── App ─────────────────────────────────────────────────────────────────── */
 export default function App() {
-  const { connected, messages, thinking, askQuery, startSession, sendMessage, answerAsk } = useAgent();
+  const {
+    connected,
+    messages,
+    thinking,
+    askQuery,
+    startSession,
+    sendMessage,
+    answerAsk,
+    branchFrom,
+    switchToNode,
+    childrenByParent,
+    activeLeafId,
+    lastBranchBaseId,
+    nodesById,
+  } = useAgent();
 
   const [provider, setProvider] = useState("ollama");
   const [model, setModel] = useState("qwen3.5:4b");
@@ -866,11 +1170,31 @@ export default function App() {
     setSessionCount((c) => c + 1);
   };
 
+  const allNodeIds = Object.keys(nodesById);
+  const branches = allNodeIds
+    .filter((id) => !childrenByParent[id] || childrenByParent[id].length === 0)
+    .map((leafId) => {
+      const leaf = nodesById[leafId];
+      return {
+        leafId,
+        preview: (leaf?.text || leaf?.tool || leaf?.role || "branch").slice(0, 26),
+      };
+    });
+
   return (
     <>
       <style>{STYLES}</style>
       <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "#faf8f4" }}>
-        <Sidebar messages={messages} sessionCount={sessionCount} onNewSession={handleNewSession} />
+        <Sidebar
+          messages={messages}
+          sessionCount={sessionCount}
+          onNewSession={handleNewSession}
+          branches={branches}
+          onSwitchToNode={switchToNode}
+          activeLeafId={activeLeafId}
+          nodesById={nodesById}
+          childrenByParent={childrenByParent}
+        />
 
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           {/* Topbar */}
@@ -951,9 +1275,30 @@ export default function App() {
             )}
 
             {messages.map((msg, i) => {
-              if (msg.role === "tool_use") return <ToolCard key={msg.id} msg={msg} />;
+              const childIds = childrenByParent[msg.id] || [];
+              if (msg.role === "tool_use")
+                return (
+                  <ToolCard
+                    key={msg.id}
+                    msg={msg}
+                    childIds={childIds}
+                    activeLeafId={activeLeafId}
+                    onSwitchToNode={switchToNode}
+                    onBranchFrom={branchFrom}
+                  />
+                );
               if (msg.role === "tool_result") return null;
-              return <Bubble key={msg.id} msg={msg} prevMsg={messages[i - 1]} />;
+              return (
+                <Bubble
+                  key={msg.id}
+                  msg={msg}
+                  prevMsg={messages[i - 1]}
+                  childIds={childIds}
+                  activeLeafId={activeLeafId}
+                  onSwitchToNode={switchToNode}
+                  onBranchFrom={branchFrom}
+                />
+              );
             })}
 
             {thinking && (
@@ -1052,6 +1397,7 @@ export default function App() {
               }}
             >
               Enter to send · Shift+Enter for new line
+              {lastBranchBaseId ? " · Branching keeps context up to the selected message." : ""}
             </p>
           </div>
         </div>

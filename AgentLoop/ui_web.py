@@ -34,10 +34,16 @@ class WebSocketSession:
         self.running_task: asyncio.Task[None] | None = None
         self.pending_answer_future: asyncio.Future[str] | None = None
         self.worker_events: asyncio.Queue[object] = asyncio.Queue()
+        self.active_path_messages: list[dict[str, str]] = []
 
     async def send(self, payload: dict[str, Any]) -> None:
         async with self.send_lock:
-            await self.websocket.send_json(payload)
+            # Browser disconnects can race with background task cleanup.
+            # Ignore send failures once the socket is already closed.
+            try:
+                await self.websocket.send_json(payload)
+            except (WebSocketDisconnect, RuntimeError):
+                pass
 
     async def display_to_user(self, text: str) -> None:
         await self.send({"type": "display", "text": text})
@@ -102,6 +108,7 @@ class WebSocketSession:
 
             self.orchestrated_loop = loop_obj
             self.current_model = selected_model
+            self._apply_active_path_to_loop()
 
     async def ensure_default_session(self) -> None:
         if self.orchestrated_loop is not None:
@@ -110,6 +117,27 @@ class WebSocketSession:
             DEFAULT_OLLAMA_MODEL if DEFAULT_PROVIDER.strip().lower() == "ollama" else ""
         )
         await self.create_session(DEFAULT_PROVIDER, default_model)
+
+    def _sanitize_path_messages(self, path_messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+        sanitized: list[dict[str, str]] = []
+        for item in path_messages:
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", ""))
+            if role not in {"user", "assistant", "system"}:
+                continue
+            sanitized.append({"role": role, "content": content})
+        return sanitized
+
+    def _apply_active_path_to_loop(self) -> None:
+        if self.orchestrated_loop is None:
+            return
+        self.orchestrated_loop.reset_and_load_context(self.active_path_messages)
+
+    async def set_active_path(self, path_messages: list[dict[str, Any]]) -> None:
+        if self.running_task and not self.running_task.done():
+            return
+        self.active_path_messages = self._sanitize_path_messages(path_messages)
+        self._apply_active_path_to_loop()
 
     async def submit_user_message(self, text: str) -> None:
         text = (text or "").strip()
@@ -138,7 +166,8 @@ class WebSocketSession:
         except Exception as exc:  # noqa: BLE001
             await self.send({"type": "system", "text": f"Request failed: {exc}"})
         finally:
-            await self.send({"type": "done"})
+            if self.websocket.client_state.name == "CONNECTED":
+                await self.send({"type": "done"})
 
     async def submit_answer(self, answer: str) -> None:
         if self.pending_answer_future is None or self.pending_answer_future.done():
@@ -209,6 +238,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if msg_type == "answer":
                 await session.submit_answer(str(msg.get("answer", "")))
+                continue
+
+            if msg_type == "set_active_path":
+                payload = msg.get("path_messages", [])
+                if not isinstance(payload, list):
+                    await session.send({"type": "system", "text": "Invalid `path_messages` payload."})
+                else:
+                    await session.set_active_path(payload)
                 continue
 
             await session.send(
