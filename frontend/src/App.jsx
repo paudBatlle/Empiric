@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 /* ── WebSocket hook ──────────────────────────────────────────────────────── */
 function useAgent() {
@@ -783,6 +783,265 @@ function AskModal({ query, onAnswer }) {
   );
 }
 
+/* ── Git-style branch graph ──────────────────────────────────────────────── */
+const LANE_COLORS = ["#4a7fc1", "#3daf72", "#a474d1", "#c4922d", "#4abcca", "#d45f8a"];
+const ACTIVE_COLOR = "#c4622d";
+const ROW_H = 30;
+const DOT_R = 4;
+const LANE_W = 16;
+const PAD_LEFT = 10;
+
+function assignLanes(nodesById, childrenByParent) {
+  const lane = {};
+  let nextLane = 0;
+  const alloc = () => nextLane++;
+  const rootIds = (childrenByParent["__root__"] || []).filter((id) => nodesById[id]);
+
+  const walk = (id, parentLane) => {
+    if (!nodesById[id] || lane[id] !== undefined) return;
+    lane[id] = parentLane ?? alloc();
+    const kids = (childrenByParent[id] || []).filter((k) => nodesById[k]);
+    kids.forEach((kid, idx) => walk(kid, idx === 0 ? lane[id] : alloc()));
+  };
+
+  rootIds.forEach((id) => walk(id, null));
+  return lane;
+}
+
+function flattenBFS(rootIds, nodesById, childrenByParent) {
+  const visited = new Set();
+  const rows = [];
+  const queue = [...rootIds];
+  while (queue.length) {
+    const id = queue.shift();
+    if (visited.has(id) || !nodesById[id]) continue;
+    visited.add(id);
+    rows.push(id);
+    (childrenByParent[id] || []).filter((k) => nodesById[k]).forEach((k) => queue.push(k));
+  }
+  return rows;
+}
+
+const shortSha = (id) => String(id || "").replace(/[^a-z0-9]/gi, "").slice(0, 6);
+const ROLE_BADGE = {
+  user: { label: "you", bg: "#1a2f4a", fg: "#5a9fd4" },
+  assistant: { label: "asst", bg: "#0d2a1e", fg: "#3daf72" },
+  tool_use: { label: "tool", bg: "#2a1f0a", fg: "#c4922d" },
+  tool_result: { label: "res", bg: "#1e1428", fg: "#a474d1" },
+  system: { label: "sys", bg: "#252530", fg: "#6a6a8a" },
+};
+
+function RowGraph({ nodeId, rowIndex, laneMap, orderIndexById, nodesById, childrenByParent, isActive, isBranchPoint }) {
+  const maxLane = Math.max(0, ...Object.values(laneMap));
+  const svgW = PAD_LEFT + (maxLane + 1) * LANE_W;
+  const cy = ROW_H / 2;
+  const myLane = laneMap[nodeId] ?? 0;
+  const cx = PAD_LEFT + myLane * LANE_W;
+  const color = LANE_COLORS[myLane % LANE_COLORS.length];
+  const lines = [];
+
+  (childrenByParent[nodeId] || []).filter((k) => nodesById[k]).forEach((kid) => {
+    const ki = orderIndexById[kid];
+    if (ki === undefined) return;
+    const childLane = laneMap[kid] ?? 0;
+    const childCx = PAD_LEFT + childLane * LANE_W;
+    const childColor = LANE_COLORS[childLane % LANE_COLORS.length];
+    const dy = (ki - rowIndex) * ROW_H;
+    if (childLane === myLane) {
+      lines.push(
+        <line
+          key={`d-${kid}`}
+          x1={cx}
+          y1={cy + DOT_R}
+          x2={cx}
+          y2={cy + dy - DOT_R}
+          stroke={color}
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+      );
+    } else {
+      const midY = cy + dy * 0.55;
+      lines.push(
+        <path
+          key={`d-${kid}`}
+          d={`M${cx} ${cy + DOT_R} C${cx} ${midY} ${childCx} ${midY} ${childCx} ${cy + dy - DOT_R}`}
+          fill="none"
+          stroke={childColor}
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+      );
+    }
+  });
+
+  const parentId = nodesById[nodeId]?.parentId;
+  if (parentId && nodesById[parentId]) {
+    const pi = orderIndexById[parentId];
+    if (pi !== undefined) {
+      const parentLane = laneMap[parentId] ?? 0;
+      const parentCx = PAD_LEFT + parentLane * LANE_W;
+      const dy = (rowIndex - pi) * ROW_H;
+      if (parentLane === myLane) {
+        lines.push(
+          <line
+            key="u"
+            x1={cx}
+            y1={cy - DOT_R}
+            x2={cx}
+            y2={cy - dy + DOT_R}
+            stroke={color}
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        );
+      } else {
+        const midY = cy - dy * 0.55;
+        lines.push(
+          <path
+            key="u"
+            d={`M${cx} ${cy - DOT_R} C${cx} ${midY} ${parentCx} ${midY} ${parentCx} ${cy - dy + DOT_R}`}
+            fill="none"
+            stroke={color}
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        );
+      }
+    }
+  }
+
+  return (
+    <svg width={svgW} height={ROW_H} style={{ overflow: "visible", flexShrink: 0, display: "block" }}>
+      {lines}
+      {isActive && <circle cx={cx} cy={cy} r={DOT_R + 4} fill="none" stroke={ACTIVE_COLOR} strokeWidth="1" opacity="0.35" />}
+      {isBranchPoint && !isActive && (
+        <circle cx={cx} cy={cy} r={DOT_R + 3.5} fill="none" stroke={color} strokeWidth="0.8" strokeDasharray="2.5 2" opacity="0.55" />
+      )}
+      <circle cx={cx} cy={cy} r={isActive ? DOT_R + 1 : DOT_R} fill={isActive ? ACTIVE_COLOR : color} stroke="#1e1e2e" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function GitGraph({ nodesById = {}, childrenByParent = {}, activeLeafId, onSwitchToNode }) {
+  const rootIds = useMemo(() => (childrenByParent["__root__"] || []).filter((id) => nodesById[id]), [nodesById, childrenByParent]);
+  const orderedIds = useMemo(() => flattenBFS(rootIds, nodesById, childrenByParent), [rootIds, nodesById, childrenByParent]);
+  const laneMap = useMemo(() => assignLanes(nodesById, childrenByParent), [nodesById, childrenByParent]);
+  const branchPoints = useMemo(
+    () => new Set(orderedIds.filter((id) => (childrenByParent[id] || []).filter((k) => nodesById[k]).length > 1)),
+    [orderedIds, nodesById, childrenByParent]
+  );
+  const lanesUsed = [...new Set(Object.values(laneMap))].sort((a, b) => a - b);
+  const orderIndexById = useMemo(
+    () =>
+      orderedIds.reduce((acc, id, idx) => {
+        acc[id] = idx;
+        return acc;
+      }, {}),
+    [orderedIds]
+  );
+
+  if (orderedIds.length === 0) return <div style={graphS.empty}>No messages yet.</div>;
+
+  return (
+    <div style={graphS.wrap}>
+      <div style={graphS.header}>
+        <span style={graphS.title}>Source graph</span>
+        <span style={graphS.count}>{orderedIds.length} nodes</span>
+      </div>
+      <div style={graphS.rows}>
+        {orderedIds.map((id, ri) => {
+          const node = nodesById[id];
+          if (!node) return null;
+          const isActive = id === activeLeafId;
+          const badge = ROLE_BADGE[node.role] || ROLE_BADGE.system;
+          const label = (node.text || node.tool || node.role || "node").replace(/\s+/g, " ").slice(0, 40);
+          return (
+            <div
+              key={id}
+              onClick={() => onSwitchToNode(id)}
+              title={node.text || node.tool || node.role}
+              style={{ ...graphS.row, background: isActive ? "#2d2040" : "transparent" }}
+              onMouseEnter={(e) => {
+                if (!isActive) e.currentTarget.style.background = "#252535";
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) e.currentTarget.style.background = "transparent";
+              }}
+            >
+              {isActive && <div style={graphS.accentBar} />}
+              <RowGraph
+                nodeId={id}
+                rowIndex={ri}
+                laneMap={laneMap}
+                orderIndexById={orderIndexById}
+                nodesById={nodesById}
+                childrenByParent={childrenByParent}
+                isActive={isActive}
+                isBranchPoint={branchPoints.has(id)}
+              />
+              <div style={graphS.meta}>
+                <span style={{ ...graphS.msg, ...(isActive ? graphS.msgActive : {}) }}>{label}</span>
+                <span style={{ ...graphS.badge, background: badge.bg, color: badge.fg }}>{badge.label}</span>
+                <span style={graphS.sha}>{shortSha(id)}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={graphS.legend}>
+        {lanesUsed.slice(0, 3).map((lane) => (
+          <div key={lane} style={graphS.legendItem}>
+            <div style={{ ...graphS.legendDot, background: LANE_COLORS[lane % LANE_COLORS.length] }} />
+            <span>{lane === 0 ? "main" : `branch-${lane}`}</span>
+          </div>
+        ))}
+        <div style={{ ...graphS.legendItem, marginLeft: "auto" }}>
+          <div style={{ ...graphS.legendDot, background: ACTIVE_COLOR, boxShadow: `0 0 5px ${ACTIVE_COLOR}88` }} />
+          <span>current</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const graphS = {
+  wrap: { background: "#1e1e2e", borderRadius: 8, overflow: "hidden", fontFamily: "'Courier New', Courier, monospace" },
+  header: { padding: "8px 12px 6px", borderBottom: "1px solid #2a2a3e", display: "flex", alignItems: "center", gap: 8 },
+  title: { fontSize: 11, fontWeight: 600, color: "#7c7c9a", letterSpacing: "0.08em", textTransform: "uppercase", flex: 1 },
+  count: { fontSize: 10, color: "#4a4a6a", background: "#2a2a3e", padding: "2px 7px", borderRadius: 10 },
+  rows: { padding: "4px 0" },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    height: ROW_H,
+    paddingRight: 8,
+    cursor: "pointer",
+    position: "relative",
+    borderRadius: 4,
+    margin: "0 4px",
+    transition: "background 0.1s",
+  },
+  accentBar: { position: "absolute", left: 0, top: 4, bottom: 4, width: 2, background: ACTIVE_COLOR, borderRadius: "0 2px 2px 0" },
+  meta: { flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6, paddingLeft: 4 },
+  msg: { fontSize: 11, color: "#c0c0d8", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1 },
+  msgActive: { color: "#e8d8c8", fontWeight: 600 },
+  badge: {
+    fontSize: 9,
+    fontWeight: 700,
+    letterSpacing: "0.06em",
+    padding: "1px 5px",
+    borderRadius: 3,
+    flexShrink: 0,
+    textTransform: "uppercase",
+  },
+  sha: { fontSize: 9, color: "#3a3a5a", flexShrink: 0 },
+  legend: { display: "flex", gap: 12, padding: "7px 12px 8px", borderTop: "1px solid #2a2a3e", flexWrap: "wrap" },
+  legendItem: { display: "flex", alignItems: "center", gap: 5, fontSize: 9, color: "#4a4a6a" },
+  legendDot: { width: 7, height: 7, borderRadius: "50%", flexShrink: 0 },
+  empty: { fontSize: 11, color: "#4a4a6a", fontStyle: "italic", padding: "10px 14px", background: "#1e1e2e", borderRadius: 8 },
+};
+
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
 function Sidebar({
   messages,
@@ -800,36 +1059,6 @@ function Sidebar({
     acc[e.tool] = (acc[e.tool] || 0) + 1;
     return acc;
   }, {});
-  const roleGlyph = { user: "●", assistant: "◆", system: "■", tool_use: "▲", tool_result: "◉" };
-  const roleColor = {
-    user: "#4a8cca",
-    assistant: "#3d9e6e",
-    system: "#8d8d84",
-    tool_use: "#c4922d",
-    tool_result: "#7a74d1",
-  };
-  const rootIds = (childrenByParent["__root__"] || []).filter((id) => nodesById[id]);
-  const treeRows = [];
-  const walkTree = (nodeId, depth = 0, ancestorContinues = [], isLast = true) => {
-    const node = nodesById[nodeId];
-    if (!node) return;
-    const labelText = node.text || node.tool || node.role || "message";
-    const shortLabel = labelText.replace(/\s+/g, " ").slice(0, 26);
-    treeRows.push({
-      id: nodeId,
-      depth,
-      isLast,
-      ancestorContinues,
-      role: node.role,
-      text: shortLabel,
-    });
-    const kids = (childrenByParent[nodeId] || []).filter((id) => nodesById[id]);
-    kids.forEach((kidId, idx) => {
-      walkTree(kidId, depth + 1, [...ancestorContinues, !isLast], idx === kids.length - 1);
-    });
-  };
-  rootIds.forEach((rootId, idx) => walkTree(rootId, 0, [], idx === rootIds.length - 1));
-
   return (
     <aside
       style={{
@@ -989,93 +1218,14 @@ function Sidebar({
               ))
             )}
             <div style={{ ...sideLabel, marginTop: 12 }}>Message tree</div>
-            {
-              <div
-                style={{
-                  maxHeight: 220,
-                  overflowY: "auto", 
-                  border: "1px solid #ddd8ce",
-                  borderRadius: 6,
-                  background: "#fcfaf7",
-                  padding: 6,
-                }}
-              >
-                {treeRows.length === 0 ? (
-                  <p style={{ fontSize: 11, color: "#9c9c91", fontStyle: "italic", margin: 6 }}>No messages yet.</p>
-                ) : (
-                  treeRows.map((row) => (
-                    <button
-                      key={row.id}
-                      onClick={() => onSwitchToNode(row.id)}
-                      style={{
-                        width: "100%",
-                        textAlign: "left",
-                        border: row.id === activeLeafId ? "1px solid #e5b79f" : "1px solid transparent",
-                        borderRadius: 4,
-                        background: row.id === activeLeafId ? "#f8ebe3" : "transparent",
-                        color: row.id === activeLeafId ? "#8f431c" : "#57574f",
-                        fontSize: 10.5,
-                        padding: "4px 6px",
-                        marginBottom: 2,
-                        cursor: "pointer",
-                        fontFamily: "'Source Sans 3','Helvetica Neue',sans-serif",
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                      }}
-                      title={nodesById[row.id]?.text || nodesById[row.id]?.tool || nodesById[row.id]?.role || "message"}
-                    >
-                      <span style={{ display: "inline-flex", alignItems: "center", height: 14 }}>
-                        {row.depth > 0 &&
-                          Array.from({ length: row.depth }).map((_, i) => {
-                            const showVLine = row.ancestorContinues[i];
-                            return (
-                              <span
-                                key={i}
-                                style={{
-                                  width: 12,
-                                  height: 14,
-                                  borderLeft: showVLine ? "1px solid #d6cec0" : "1px solid transparent",
-                                  marginRight: 1,
-                                }}
-                              />
-                            );
-                          })}
-                        {row.depth > 0 && (
-                          <span
-                            style={{
-                              width: 12,
-                              height: 14,
-                              borderLeft: "1px solid #d6cec0",
-                              borderBottom: "1px solid #d6cec0",
-                              borderBottomLeftRadius: 4,
-                              marginRight: 2,
-                            }}
-                          />
-                        )}
-                      </span>
-                      <span
-                        style={{
-                          color: roleColor[row.role] || "#6b6b63",
-                          fontSize: 11,
-                          fontWeight: 700,
-                          minWidth: 10,
-                        }}
-                      >
-                        {roleGlyph[row.role] || "•"}
-                      </span>
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {row.id === activeLeafId ? "Current · " : ""}
-                        {row.text}
-                      </span>
-                    </button>
-                  ))
-                )}
-              </div>
-            }
+            <div style={{ marginTop: 6, maxHeight: 260, overflowY: "auto" }}>
+              <GitGraph
+                nodesById={nodesById}
+                childrenByParent={childrenByParent}
+                activeLeafId={activeLeafId}
+                onSwitchToNode={onSwitchToNode}
+              />
+            </div>
           </div>
         </>
       )}
