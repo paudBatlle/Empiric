@@ -97,9 +97,15 @@ def create_tool_display_to_user(
     displayer: Callable[[str], Awaitable[None]],
 ) -> Type[Tool]:
     class ToolDisplayToUser(Tool):
-        """Display information to the user without waiting for input."""
+        """Show a short status or progress line to the user; does not wait for a reply.
 
-        text: str = Field(description="Text to display to the user")
+        Use for transient updates (e.g. before/while other tools run). Put the main
+        explanation in your normal assistant message instead; do not repeat the same
+        text here and in your prose reply."""
+
+        text: str = Field(
+            description="Brief status or progress for the user (avoid duplicating your main reply)"
+        )
 
         async def __call__(self) -> str:
             await displayer(self.text)
